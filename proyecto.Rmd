@@ -1,0 +1,197 @@
+---
+title: "Proyecto Grupo "
+output: html_notebook
+---
+```{r}
+# imports necesarios
+
+library(ggplot2)
+library(corrplot)
+```
+
+```{r}
+# Carga de datos
+train = read.csv("data/data_train_v3.csv", stringsAsFactors = T)
+test = read.csv("data/test_v3.csv", stringsAsFactors = T)
+
+dir.create("output", showWarnings = F)
+
+```
+
+## EDA
+
+```{r}
+
+str(train)
+summary(train)
+
+```
+```{r}
+# las variables MSSubClass es tomada como númerica, pero en la descripcion indica que es categorica, por lo que se trata como tal
+
+train$MSSubClass <- as.factor(train$MSSubClass)
+test$MSSubClass  <- as.factor(test$MSSubClass)
+
+var_target = 'SalePrice'
+```
+
+---
+
+#### Analizando variables numericas
+
+```{r}
+num_vars <- sapply(train, is.numeric)
+num_df <- train[, num_vars]
+
+# el id no se toma en cuenta como variable numerica, ya que solo es un correlativo de registro y no aporta nada
+# sino mas bien, aportaria ruido
+
+num_df <- num_df[, setdiff(names(num_df), "Id")]
+
+for (var in names(num_df)) {
+  grafica = ggplot(num_df, aes(x = .data[[var]])) +
+    geom_density(fill = "steelblue3", alpha=0.6) +
+    labs(title = paste("Densidad de", var), x = var, y = "Densidad") +
+    theme_minimal()
+  print(grafica)
+}
+
+```
+Ninguna variable muestra distribución normal, más bien oscilan entre sesgadas a la derecha y mulimodalidad, lo que sugiere valores atípicos y posible influencia de períodos de tiempo, categorías o segmentos subyacentes, lo cual valdría la pena investigar.
+
+La variable objetivo **SalePrice** muestra sesgo positivo, por lo que se deberia aplicar una transformación logaritmica, para que los valores no varien tanto
+
+```{r}
+
+correlaciones = sort(cor(num_df, use="complete.obs")[,"SalePrice"], decreasing = TRUE)
+cat("\nTop 15 correlaciones con SalePrice:\n")
+print(round(head(correlaciones, 15), 3))
+cat("\nVariables con correlacion mas negativa:\n")
+print(round(tail(correlaciones, 5), 3))
+
+top_vars =  names(head(correlaciones, 11))
+
+corrplot(cor(num_df[, top_vars], use="complete.obs"), method="color",
+         addCoef.col = "black", number.cex=0.7,
+         tl.cex=0.8, tl.col="black")
+
+guardar_grafica("output/02_corr_heatmap", grafica_correlacion)
+png("output/02_corr_heatmap.png", width=800, height=800)
+corrplot(cor(num_df[, top_vars], use="complete.obs"), method="color",
+         type="upper", addCoef.col = "black", number.cex=0.7,
+         tl.cex=0.8, tl.col="black")
+dev.off()
+
+```
+Los resultados indican que el precio de venta está principalmente asociado con tres factores:
+
+Calidad de la vivienda (OverallQual).
+Tamaño y superficie habitable (GrLivArea, TotalBsmtSF, X1stFlrSF).
+Capacidad y tamaño del garaje (GarageCars, GarageArea).
+
+Los cuales deberían considerarse entre los predictores más importantes para el modelo
+Dichos predictores también muestran correlación entre si, lo que puede generar multicolinealidad en 
+modelos lineales
+
+##### Analisis con log(SalePrice) para reducir sesgo positivo 
+```{r}
+
+## aplicando log() a SalePrice
+
+cor_comp <- data.frame(
+  Variable = names(num_df),
+  Corr_SalePrice = cor(num_df, train$SalePrice, use = "complete.obs"),
+  Corr_LogSalePrice = cor(num_df, log(train$SalePrice), use = "complete.obs")
+)
+
+cor_comp[order(-abs(cor_comp$Corr_LogSalePrice)), ]
+
+```
+
+Aplicando logaritmo a **SalePrice** la correlacion entre variables se hace un poco mayor en totas las variables
+
+
+---
+
+### Analizando variables categoricas
+```{r}
+graficar_barras = function(df, variable) {
+  grafica = ggplot(df, aes(x = factor(.data[[variable]]))) +
+    geom_bar(fill = "steelblue") +
+    labs(title = paste("Histograma", variable), x = variable, y = "Frecuencia") + 
+    theme_minimal()
+  
+  return(grafica)
+}
+
+graficar_boxplot = function(df, variable, objetivo) {
+  grafica = ggplot(df, aes(x = factor(.data[[variable]]), y = .data[[objetivo]], fill= .data[[variable]])) + 
+    geom_boxplot() + 
+    labs(title = paste(objetivo, "según", variable), x = variable, y = objetivo) +
+    theme_minimal()
+  
+  return(grafica)
+}
+```
+
+
+### Analizando variables categoricas
+```{r}
+cat_var = sapply(train, is.factor)
+cat_df = train[ , cat_var]
+
+for (var in names(cat_df)){
+  print(graficar_barras(cat_df, var))
+  print(graficar_boxplot(train, var, var_target))
+}
+```
+
+---
+```{r}
+names(cat_df)
+```
+
+#### Analizando variable numericas de correlacion fuerte con la variable objetivo
+```{r}
+box_vars = c('OverallQual', 'GarageCars')
+corr_vars = c('GrLivArea', 'TotalBsmtSF')
+
+graficar_relacion = function (df, x, y){
+  grafica = ggplot(df, aes(x=.data[[x]], y=.data[[y]])) +
+  geom_point(alpha=0.5) +
+  labs(title=paste(y, "vs", x))
+  
+  return (grafica)
+}
+
+for (var in box_vars) {
+  print(graficar_boxplot(train, var, var_target))
+}
+
+for (var in corr_vars) {
+  print(graficar_relacion(train, var, var_target))
+}
+
+
+```
+Se observa una relación positiva consistente entre SalePrice y las variables analizadas. OverallQual presenta la asociación más fuerte, evidenciando que la calidad general de la vivienda es el principal determinante del precio. Asimismo, variables relacionadas con el tamaño de la vivienda como GrLivArea y TotalBsmtSF muestran una clara tendencia creciente, sugiriendo que la superficie construida es un factor clave en la valoración inmobiliaria. Finalmente, GarageCars también contribuye positivamente, aunque con mayor dispersión, indicando un efecto secundario respecto a las variables de calidad y tamaño.
+
+
+### Analisis de variable objetivo
+
+Como se evidencio anteriormente la variable tiene sesgo positivo, por lo que se comparara su grafica de densidad con el logaritmo aplicado a dicha variable
+
+```{r}
+grafica_sp = ggplot(train, aes(x = SalePrice)) +
+    geom_density(fill = "tomato", alpha=0.6) +
+    labs(title ="Densidad de Saleprice", x = var, y = "Densidad") +
+    theme_minimal()
+print(grafica_sp)
+  
+grafica_log = ggplot(train, aes(x = log(SalePrice))) +
+    geom_density(fill = "steelblue2", alpha=0.6) +
+    labs(title = "Densidad de Log(Saleprice)", x = var, y = "Densidad") +
+    theme_minimal()
+  (grafica_log)
+```
+Tras aplicar la transformación logarítmica, la distribución de log(SalePrice) se vuelve considerablemente más simétrica y cercana a una distribución normal, reduciendo la influencia de los valores extremos. Por este motivo, se utilizará log(SalePrice) como variable objetivo en los modelos predictivos.
