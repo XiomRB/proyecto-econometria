@@ -284,10 +284,268 @@ train <- train %>% mutate(log_SalePrice = log(SalePrice))
 ```
 
 
+## Expermientos con diferentes Algoritmos
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(broom)
+
+```
+
+#### Configuración de tablas para revisión de RMSE
+Se tiene la tabla `historico_modelos`, para ingresar el RMSE menor que se haya obtenido por cada modelo.
+
+```{r}
+historico_modelos <- data.frame(
+  Modelo = character(),
+  RMSE_CV = numeric(),
+  stringsAsFactors = FALSE
+)
+
+registrar_modelo <- function(nombre, rmse_valor) {
+  
+  existe <- nombre %in% historico_modelos$Modelo
+  
+  if (existe) {
+    historico_modelos$RMSE_CV[historico_modelos$Modelo == nombre] <<- rmse_valor
+  } else {
+    nueva_fila <- data.frame(
+      Modelo = nombre,
+      RMSE_CV = rmse_valor
+    )
+    historico_modelos <<- rbind(historico_modelos, nueva_fila)
+  }
+  
+  historico_modelos <<- historico_modelos[order(historico_modelos$RMSE_CV), ]
+}
+
+```
+
+Tabla `historial_versiones` que funciona como auxiliar para ir validando el mismo modelo y ajustando parametros, recetas..
+
+```{r}
+historial_versiones <- data.frame(
+  Fecha_Hora   = character(),
+  Modelo       = character(),
+  Descripcion  = character(),
+  RMSE_CV      = numeric(),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r}
+registrar_intento_modelo <- function(nombre_modelo, descripcion_cambio, rmse_valor) {
+  marca_tiempo <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  
+  nuevo_registro <- data.frame(
+    Fecha_Hora   = marca_tiempo,
+    Modelo       = nombre_modelo,
+    Descripcion  = descripcion_cambio,
+    RMSE_CV      = rmse_valor,
+    stringsAsFactors = FALSE
+  )
+  
+  historial_versiones <<- rbind(historial_versiones, nuevo_registro)
+  
+  if (nrow(historial_versiones) > 1) {
+    ultimo_rmse <- historial_versiones$RMSE_CV[nrow(historial_versiones)]
+    penultimo_rmse <- historial_versiones$RMSE_CV[nrow(historial_versiones) - 1]
+    diferencia <- ultimo_rmse - penultimo_rmse
+    
+    if (diferencia < 0) {
+      cat(paste0("RMSE bajó en ", round(abs(diferencia), 5), " unidades respecto al intento anterior\n"))
+    } else if (diferencia > 0) {
+      cat(paste0("RMSE subió en ", round(diferencia, 5), " unidades.\n"))
+    } else {
+      cat("RMSE se mantuvo exactamente igual.\n")
+    }
+  }
+}
+
+```
+
+
+### Configuración de validación Cruzada
+Bloque de validación cruzada para tomar cualquier pipeline, lo entrena en los pliegues y devuelve el RMSE.
+
+```{r}
+set.seed(300)
+
+cv_folds <- vfold_cv(train, v = 10)
+
+evaluar_rmse_modelo <- function(pipeline_a_evaluar, nombre_modelo) {
+  
+  resultados_cv <- fit_resamples(
+    pipeline_a_evaluar,
+    resamples = cv_folds,
+    metrics = metric_set(rmse),
+    control = control_resamples(save_pred = TRUE)
+  )
+  
+  rmse_valor <- collect_metrics(resultados_cv) %>% 
+    filter(.metric == "rmse") %>% 
+    pull(mean)
+  
+  cat("Modelo:", nombre_modelo, "\n")
+  cat("RMSE Promedio en Validación Cruzada:", round(rmse_valor, 5), "\n")
+  
+  return(rmse_valor)
+}
+
+```
+
+### Preprocesador
+Para OLS
+```{r}
+recipe_base <- recipe(log_SalePrice ~ ., data = train %>% select(-SalePrice)) %>%
+  update_role(Id, new_role = "ID") %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors(), new_level = "Desconocido") %>%
+  step_other(all_nominal_predictors(), threshold = 0.02, other = "Other") %>%
+  step_impute_median(LotFrontage) %>% 
+  step_nzv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  step_lincomb(all_numeric_predictors())
+
+```
+
+### Experimento con Regresión OLS
+
+```{r}
+nombre_modelo_actual = "Regresión Lineal OLS"
+
+ols_spec <- linear_reg() %>% 
+  set_engine("lm")
+
+pipeline_ols <- workflow() %>%
+  add_recipe(recipe_base) %>%
+  add_model(ols_spec)
+
+rmse_ols <- evaluar_rmse_modelo(pipeline_ols, nombre_modelo_actual)
+
+ols_ajustado <- fit(pipeline_ols, data = train)
+
+ols_global <- glance(ols_ajustado)
+print(ols_global)
+
+ols_variables <- tidy(ols_ajustado)
+
+ols_variables %>% 
+  filter(p.value < 0.05) %>% 
+  arrange(p.value) %>% 
+  print(n = 15)
+
+
+registrar_intento_modelo(
+  nombre_modelo = nombre_modelo_actual, 
+  descripcion_cambio = "Corrección de recipe", 
+  rmse_valor = rmse_ols
+)
+
+registrar_modelo(nombre_modelo_actual, rmse_ols)
+
+```
+
+Modelo OLS y se eliminó el error de rango deficiente. Se tiene este modelo como punto de partida con un RMSE de 0.15377 (medido en la escala logarítmica).
+
+Analizando las estadísticas el r cuadarado ajustado es de 0.901, las variables actuales logran explicar el 90% de variabilidad del precio de las casas. El modelo identificó las variables clave como la calidad general de la casa `OverallQuall`, la condición `OverallCond` y factores de penalización como estar en vecindarios específicos `Neighborhood_Edwards` o tener una zona comercial desfavorable. 
+
+Se sabe que pueden haber modelos que pueden mejorar esta salida, ya que se tiene variable donde los p-valores van subiendo y una penalización reducirá los coeficientes. 
+
+
+### Experiemnto con Regresión Lasso
+```{r}
+nombre_modelo_actual = "Regresión Lasso"
+
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+recipe_lasso <- recipe_base %>% 
+  step_normalize(all_numeric_predictors())
+
+pipeline_lasso_inicial <- workflow() %>%
+  add_recipe(recipe_lasso) %>%
+  add_model(lasso_spec)
+
+lasso_grid <- grid_regular(penalty(range = c(-4, -1)), levels = 30)
+
+lasso_tune <- tune_grid(
+  pipeline_lasso_inicial,
+  resamples = cv_folds,
+  grid = lasso_grid,
+  metrics = metric_set(rmse)
+)
+
+mejor_lasso_param <- select_best(lasso_tune, metric = "rmse")
+
+pipeline_lasso <- finalize_workflow(pipeline_lasso_inicial, mejor_lasso_param)
+
+rmse_lasso <- evaluar_rmse_modelo(pipeline_lasso, nombre_modelo_actual)
+
+registrar_modelo(nombre_modelo_actual, rmse_lasso)
+
+registrar_intento_modelo(
+  nombre_modelo = nombre_modelo_actual,
+  descripcion_cambio = "Preuba de Lasso",
+  rmse_valor = rmse_lasso
+)
+```
+
+```{r}
+print(historico_modelos)
+```
+
+Hasta este punto el mejor modelo es el experimento con el algoritmo "Regressión Lasso"
+
+```{r}
+lasso_entrenado <- fit(pipeline_lasso, data = train)
+
+exportar_predicciones_test(
+  pipeline_entrenado = lasso_entrenado, 
+  nombre_modelo = nombre_modelo_actual, 
+  rmse_valor = rmse_lasso
+)
+
+```
+
+### 
+```{r}
+print(mejor_lasso_param)
+cat("\n")
+print(historico_modelos)
+cat("\n")
+print(historial_versiones)
+```
 
 
 
 
+## Exportación de Resultados
+```{r}
+exportar_predicciones_test <- function(pipeline_entrenado, nombre_modelo, rmse_valor) {
+  
+  if (!dir.exists("output")) dir.create("output", showWarnings = FALSE)
+  
+  cat("Generando predicciones sobre el set de prueba\n")
+  test_con_predicciones <- augment(pipeline_entrenado, new_data = test)
+  
+  archivo_salida <- data.frame(
+    Id = test_con_predicciones$Id,
+    SalePrice = exp(test_con_predicciones$.pred)
+  )
+  
+  nombre_ <- gsub(" ", "_", tolower(nombre_modelo))
+  rmse_texto <- round(rmse_valor, 5)
+  
+  ruta_salida <- paste0("output/predicciones_", nombre_, "_rmse_", rmse_texto, ".csv")
+  
+  write.csv(archivo_salida, file = ruta_salida, row.names = FALSE)
+  
+  cat("Modelo:", nombre_modelo, "\n")
+  cat("RMSE de Validación:", rmse_texto, "\n")
+}
+
+```
 
 
 
