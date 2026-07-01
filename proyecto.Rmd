@@ -158,12 +158,6 @@ corrplot(cor(num_df[, top_vars], use="complete.obs"), method="color",
          addCoef.col = "black", number.cex=0.7,
          tl.cex=0.8, tl.col="black")
 
-guardar_grafica("output/02_corr_heatmap", grafica_correlacion)
-png("output/02_corr_heatmap.png", width=800, height=800)
-corrplot(cor(num_df[, top_vars], use="complete.obs"), method="color",
-         type="upper", addCoef.col = "black", number.cex=0.7,
-         tl.cex=0.8, tl.col="black")
-dev.off()
 
 ```
 Los resultados indican que el precio de venta está principalmente asociado con tres factores:
@@ -399,13 +393,42 @@ Para OLS
 ```{r}
 recipe_base <- recipe(log_SalePrice ~ ., data = train %>% select(-SalePrice)) %>%
   update_role(Id, new_role = "ID") %>%
+
   step_string2factor(all_nominal_predictors()) %>%
   step_unknown(all_nominal_predictors(), new_level = "Desconocido") %>%
+  step_novel(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.02, other = "Other") %>%
+
   step_impute_median(LotFrontage) %>% 
-  step_nzv(all_predictors()) %>%
-  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
-  step_lincomb(all_numeric_predictors())
+  step_dummy(all_nominal_predictors()) %>%
+  step_nzv(all_predictors()) 
+```
+
+
+## Exportación de Resultados
+```{r}
+exportar_predicciones_test <- function(pipeline_entrenado, nombre_modelo, rmse_valor) {
+  
+  if (!dir.exists("output")) dir.create("output", showWarnings = FALSE)
+  
+  cat("Generando predicciones sobre el set de prueba\n")
+  test_con_predicciones <- augment(pipeline_entrenado, new_data = test)
+  
+  archivo_salida <- data.frame(
+    Id = test_con_predicciones$Id,
+    SalePrice = exp(test_con_predicciones$.pred)
+  )
+  
+  nombre_ <- gsub(" ", "_", tolower(nombre_modelo))
+  rmse_texto <- round(rmse_valor, 5)
+  
+  ruta_salida <- paste0("output/predicciones_", nombre_, "_rmse_", rmse_texto, ".csv")
+  
+  write.csv(archivo_salida, file = ruta_salida, row.names = FALSE)
+  
+  cat("Modelo:", nombre_modelo, "\n")
+  cat("RMSE de Validación:", rmse_texto, "\n")
+}
 
 ```
 
@@ -417,8 +440,11 @@ nombre_modelo_actual = "Regresión Lineal OLS"
 ols_spec <- linear_reg() %>% 
   set_engine("lm")
 
+recipe_ols <- recipe_base %>% 
+  step_lincomb(all_numeric_predictors())
+
 pipeline_ols <- workflow() %>%
-  add_recipe(recipe_base) %>%
+  add_recipe(recipe_ols) %>%
   add_model(ols_spec)
 
 rmse_ols <- evaluar_rmse_modelo(pipeline_ols, nombre_modelo_actual)
@@ -430,7 +456,7 @@ print(ols_global)
 
 ols_variables <- tidy(ols_ajustado)
 
-ols_variables %>% 
+  ols_variables %>% 
   filter(p.value < 0.05) %>% 
   arrange(p.value) %>% 
   print(n = 15)
@@ -453,6 +479,13 @@ Analizando las estadísticas el r cuadarado ajustado es de 0.901, las variables 
 Se sabe que pueden haber modelos que pueden mejorar esta salida, ya que se tiene variable donde los p-valores van subiendo y una penalización reducirá los coeficientes. 
 
 
+```{r}
+# recipe para modelos regularizados
+recipe_reg <- recipe_base %>% 
+  step_normalize(all_numeric_predictors())
+```
+
+
 ### Experiemnto con Regresión Lasso
 ```{r}
 nombre_modelo_actual = "Regresión Lasso"
@@ -460,11 +493,8 @@ nombre_modelo_actual = "Regresión Lasso"
 lasso_spec <- linear_reg(penalty = tune(), mixture = 1) %>% 
   set_engine("glmnet")
 
-recipe_lasso <- recipe_base %>% 
-  step_normalize(all_numeric_predictors())
-
 pipeline_lasso_inicial <- workflow() %>%
-  add_recipe(recipe_lasso) %>%
+  add_recipe(recipe_reg) %>%
   add_model(lasso_spec)
 
 lasso_grid <- grid_regular(penalty(range = c(-4, -1)), levels = 30)
@@ -508,9 +538,59 @@ exportar_predicciones_test(
 
 ```
 
+### Experimento con Regresión Ridge
+```{r}
+nombre_modelo_actual = "Regresión Ridge"
+
+ridge_spec <- linear_reg(penalty = tune(), mixture = 0) %>% 
+  set_engine("glmnet")
+
+pipeline_ridge_inicial <- workflow() %>%
+  add_recipe(recipe_reg) %>%
+  add_model(ridge_spec)
+
+ridge_grid <- grid_regular(penalty(range = c(-4, 1)), levels = 30)
+
+ridge_tune <- tune_grid(
+  pipeline_ridge_inicial,
+  resamples = cv_folds,
+  grid = ridge_grid,
+  metrics = metric_set(rmse)
+)
+
+mejor_ridge_param <- select_best(ridge_tune, metric = "rmse")
+
+pipeline_ridge <- finalize_workflow(pipeline_ridge_inicial, mejor_ridge_param)
+
+rmse_ridge <- evaluar_rmse_modelo(pipeline_ridge, nombre_modelo_actual)
+
+registrar_modelo(nombre_modelo_actual, rmse_ridge)
+
+registrar_intento_modelo(
+  nombre_modelo = nombre_modelo_actual,
+  descripcion_cambio = "Prueba de Ridge",
+  rmse_valor = rmse_ridge
+)
+```
+
+```{r}
+ridge_entrenado <- fit(pipeline_ridge, data = train)
+
+exportar_predicciones_test(
+  pipeline_entrenado = ridge_entrenado,
+  nombre_modelo = nombre_modelo_actual,
+  rmse_valor = rmse_ridge
+)
+```
+
+```{r}
+```
+
 ### 
 ```{r}
 print(mejor_lasso_param)
+cat("\n")
+print(mejor_ridge_param)
 cat("\n")
 print(historico_modelos)
 cat("\n")
@@ -520,32 +600,6 @@ print(historial_versiones)
 
 
 
-## Exportación de Resultados
-```{r}
-exportar_predicciones_test <- function(pipeline_entrenado, nombre_modelo, rmse_valor) {
-  
-  if (!dir.exists("output")) dir.create("output", showWarnings = FALSE)
-  
-  cat("Generando predicciones sobre el set de prueba\n")
-  test_con_predicciones <- augment(pipeline_entrenado, new_data = test)
-  
-  archivo_salida <- data.frame(
-    Id = test_con_predicciones$Id,
-    SalePrice = exp(test_con_predicciones$.pred)
-  )
-  
-  nombre_ <- gsub(" ", "_", tolower(nombre_modelo))
-  rmse_texto <- round(rmse_valor, 5)
-  
-  ruta_salida <- paste0("output/predicciones_", nombre_, "_rmse_", rmse_texto, ".csv")
-  
-  write.csv(archivo_salida, file = ruta_salida, row.names = FALSE)
-  
-  cat("Modelo:", nombre_modelo, "\n")
-  cat("RMSE de Validación:", rmse_texto, "\n")
-}
-
-```
 
 
 
