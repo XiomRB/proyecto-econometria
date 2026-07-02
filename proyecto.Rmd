@@ -436,7 +436,7 @@ exportar_predicciones_test <- function(pipeline_entrenado, nombre_modelo, rmse_v
   
   archivo_salida <- data.frame(
     Id = test_con_predicciones$Id,
-    SalePrice = exp(test_con_predicciones$.pred)
+    SalePrice = round(exp(test_con_predicciones$.pred), 2)
   )
   
   nombre_ <- gsub(" ", "_", tolower(nombre_modelo))
@@ -470,19 +470,6 @@ pipeline_ols <- workflow() %>%
 resultado_ols <- evaluar_rmse_modelo(pipeline_ols, nombre_modelo_actual)
 rmse_ols      <- resultado_ols$rmse
 
-ols_ajustado <- fit(pipeline_ols, data = train)
-
-ols_global <- glance(ols_ajustado)
-print(ols_global)
-
-ols_variables <- tidy(ols_ajustado)
-
-  ols_variables %>% 
-  filter(p.value < 0.05) %>% 
-  arrange(p.value) %>% 
-  print(n = 15)
-
-
 registrar_intento_modelo(
   nombre_modelo = nombre_modelo_actual, 
   descripcion_cambio = "Corrección de recipe", 
@@ -493,11 +480,31 @@ registrar_modelo(nombre_modelo_actual, rmse_ols)
 
 ```
 
-Modelo OLS y se eliminó el error de rango deficiente. Se tiene este modelo como punto de partida con un RMSE de 0.15377 (medido en la escala logarítmica).
+Modelo OLS; se tiene este modelo como punto de partida con un RMSE de 0.14745 (medido en la escala logarítmica).
 
+```{r}
+ols_ajustado <- fit(pipeline_ols, data = train)
+
+print(glance(ols_ajustado))
+
+ols_variables <- tidy(ols_ajustado)
+
+ols_variables %>% 
+  filter(p.value < 0.05) %>% 
+  arrange(p.value) %>% 
+  print(n = 15)
+```
 Analizando las estadísticas el r cuadarado ajustado es de 0.901, las variables actuales logran explicar el 90% de variabilidad del precio de las casas. El modelo identificó las variables clave como la calidad general de la casa `OverallQuall`, la condición `OverallCond` y factores de penalización como estar en vecindarios específicos `Neighborhood_Edwards` o tener una zona comercial desfavorable. 
 
 Se sabe que pueden haber modelos que pueden mejorar esta salida, ya que se tiene variable donde los p-valores van subiendo y una penalización reducirá los coeficientes. 
+
+```{r}
+exportar_predicciones_test(
+  pipeline_entrenado = ols_ajustado, 
+  nombre_modelo = nombre_modelo_actual, 
+  rmse_valor = rmse_ols
+)
+```
 
 
 ```{r}
