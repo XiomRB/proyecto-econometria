@@ -3,11 +3,13 @@ title: "Proyecto Grupo "
 output: html_notebook
 ---
 ```{r}
-# imports necesarios
+
 
 library(ggplot2)
 library(corrplot)
+library(tidyverse)
 library(DataExplorer)
+
 ```
 
 ```{r}
@@ -381,9 +383,27 @@ evaluar_rmse_modelo <- function(pipeline_a_evaluar, nombre_modelo) {
     pull(mean)
   
   cat("Modelo:", nombre_modelo, "\n")
-  cat("RMSE Promedio en Validación Cruzada:", round(rmse_valor, 5), "\n")
+  cat("RMSE Promedio en Validacion Cruzada:", round(rmse_valor, 5), "\n")
   
-  return(rmse_valor)
+  # Se devuelve lista con RMSE log y predicciones CV
+  # para calcular el RMSE en dolares correctamente
+  return(list(rmse = rmse_valor, preds_cv = collect_predictions(resultados_cv)))
+}
+
+# Calcular RMSE en dolares usando predicciones de CV
+calcular_rmse_real_cv <- function(resultado_evaluar, datos, nombre_modelo) {
+  preds_cv   <- resultado_evaluar$preds_cv
+  real_log   <- datos$log_SalePrice[preds_cv$.row]
+  real_price <- exp(real_log)
+  pred_price <- exp(preds_cv$.pred)
+
+  rmse_real <- sqrt(mean((real_price - pred_price)^2))
+
+  cat("Modelo:", nombre_modelo, "\n")
+  cat("RMSE en dolares (CV, escala real): $",
+      format(round(rmse_real, 2), big.mark = ","), "\n\n")
+
+  return(invisible(rmse_real))
 }
 
 ```
@@ -395,8 +415,8 @@ recipe_base <- recipe(log_SalePrice ~ ., data = train %>% select(-SalePrice)) %>
   update_role(Id, new_role = "ID") %>%
 
   step_string2factor(all_nominal_predictors()) %>%
-  step_unknown(all_nominal_predictors(), new_level = "Desconocido") %>%
   step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors(), new_level = "Desconocido") %>%
   step_other(all_nominal_predictors(), threshold = 0.02, other = "Other") %>%
 
   step_impute_median(LotFrontage) %>% 
@@ -447,7 +467,8 @@ pipeline_ols <- workflow() %>%
   add_recipe(recipe_ols) %>%
   add_model(ols_spec)
 
-rmse_ols <- evaluar_rmse_modelo(pipeline_ols, nombre_modelo_actual)
+resultado_ols <- evaluar_rmse_modelo(pipeline_ols, nombre_modelo_actual)
+rmse_ols      <- resultado_ols$rmse
 
 ols_ajustado <- fit(pipeline_ols, data = train)
 
@@ -510,7 +531,8 @@ mejor_lasso_param <- select_best(lasso_tune, metric = "rmse")
 
 pipeline_lasso <- finalize_workflow(pipeline_lasso_inicial, mejor_lasso_param)
 
-rmse_lasso <- evaluar_rmse_modelo(pipeline_lasso, nombre_modelo_actual)
+resultado_lasso <- evaluar_rmse_modelo(pipeline_lasso, nombre_modelo_actual)
+rmse_lasso      <- resultado_lasso$rmse
 
 registrar_modelo(nombre_modelo_actual, rmse_lasso)
 
@@ -522,6 +544,7 @@ registrar_intento_modelo(
 ```
 
 ```{r}
+
 print(historico_modelos)
 ```
 
@@ -536,6 +559,9 @@ exportar_predicciones_test(
   rmse_valor = rmse_lasso
 )
 
+
+print(mejor_lasso_param)
+cat("\n")
 ```
 
 ### Experimento con Regresión Ridge
@@ -562,7 +588,8 @@ mejor_ridge_param <- select_best(ridge_tune, metric = "rmse")
 
 pipeline_ridge <- finalize_workflow(pipeline_ridge_inicial, mejor_ridge_param)
 
-rmse_ridge <- evaluar_rmse_modelo(pipeline_ridge, nombre_modelo_actual)
+resultado_ridge <- evaluar_rmse_modelo(pipeline_ridge, nombre_modelo_actual)
+rmse_ridge      <- resultado_ridge$rmse
 
 registrar_modelo(nombre_modelo_actual, rmse_ridge)
 
@@ -581,16 +608,170 @@ exportar_predicciones_test(
   nombre_modelo = nombre_modelo_actual,
   rmse_valor = rmse_ridge
 )
+
+
+print(mejor_ridge_param)
+```
+
+### Experimento con Regresión Elastic Net
+
+
+```{r}
+nombre_modelo_actual = "Elastic Net"
+
+# Se busca conjuntamente el mejor penalty y el mejor mixture.
+enet_spec <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet")
+
+pipeline_enet_inicial <- workflow() %>%
+  add_recipe(recipe_reg) %>%
+  add_model(enet_spec)
+
+# Grid de busqueda: 20 combinaciones de penalty x mixture
+enet_grid <- grid_regular(
+  penalty(range = c(-4, 1)),
+  mixture(range = c(0, 1)),
+  levels = c(20, 6)
+)
+
+enet_tune <- tune_grid(
+  pipeline_enet_inicial,
+  resamples = cv_folds,
+  grid = enet_grid,
+  metrics = metric_set(rmse)
+)
+
+mejor_enet_param <- select_best(enet_tune, metric = "rmse")
+
+pipeline_enet <- finalize_workflow(pipeline_enet_inicial, mejor_enet_param)
+
+resultado_enet <- evaluar_rmse_modelo(pipeline_enet, nombre_modelo_actual)
+rmse_enet      <- resultado_enet$rmse
+
+registrar_modelo(nombre_modelo_actual, rmse_enet)
+
+registrar_intento_modelo(
+  nombre_modelo = nombre_modelo_actual,
+  descripcion_cambio = "Prueba de Elastic Net",
+  rmse_valor = rmse_enet
+)
 ```
 
 ```{r}
+enet_entrenado <- fit(pipeline_enet, data = train)
+
+exportar_predicciones_test(
+  pipeline_entrenado = enet_entrenado,
+  nombre_modelo = nombre_modelo_actual,
+  rmse_valor = rmse_enet
+)
+
+print(mejor_enet_param)
 ```
+
+
+
+### Experimento con Stepwise Forward Selection
+```{r}
+
+# step_nzv y step_dummy ya manejan la reduccion de variables,
+# por lo que el punto de partida del stepwise es un modelo vacio
+# (solo intercepto) y se van agregando variables una a una
+# segun el criterio AIC (menor AIC = mejor modelo).
+
+nombre_modelo_actual = "Stepwise Forward"
+
+# Preparar la recipe y extraer los datos transformados
+recipe_prep <- prep(recipe_ols, training = train)
+train_baked <- bake(recipe_prep, new_data = train)
+test_baked  <- bake(recipe_prep, new_data = test)
+
+# Quitar columnas no predictoras del dataset preparado
+train_baked$Id         <- NULL
+train_baked$SalePrice  <- NULL
+
+# Modelo nulo (solo intercepto) y modelo completo (todas las variables)
+modelo_nulo     <- lm(log_SalePrice ~ 1, data = train_baked)
+modelo_completo <- lm(log_SalePrice ~ ., data = train_baked)
+
+# Stepwise Forward: empieza desde el modelo nulo y agrega
+# variables mientras mejore el AIC
+stepwise_forward <- stats::step(
+  modelo_nulo,
+  scope   = list(lower = modelo_nulo, upper = modelo_completo),
+  direction = "forward",
+  trace   = 0  
+)
+
+cat("Variables seleccionadas por Stepwise Forward:",
+    length(coef(stepwise_forward)) - 1, "\n")
+
+# se utiliza validacion cruzada manual (10-fold) para poder compararlo con los demas modelos en la misma metrica
+set.seed(42)
+n        <- nrow(train_baked)
+folds    <- sample(rep(1:10, length.out = n))
+rmse_folds <- numeric(10)
+
+for (k in 1:10) {
+  idx_val  <- which(folds == k)
+  idx_trn  <- which(folds != k)
+
+  
+  vars_sel <- names(coef(stepwise_forward))[-1]  # quitar intercepto
+  formula_sel <- as.formula(
+    paste("log_SalePrice ~", paste(vars_sel, collapse = " + "))
+  )
+
+  modelo_fold <- lm(formula_sel, data = train_baked[idx_trn, ])
+  preds       <- predict(modelo_fold, newdata = train_baked[idx_val, ])
+  rmse_folds[k] <- sqrt(mean((train_baked$log_SalePrice[idx_val] - preds)^2))
+}
+
+rmse_stepwise <- mean(rmse_folds)
+
+registrar_modelo(nombre_modelo_actual, rmse_stepwise)
+
+registrar_intento_modelo(
+  nombre_modelo = nombre_modelo_actual,
+  descripcion_cambio = "Prueba Stepwise Forward",
+  rmse_valor = rmse_stepwise
+)
+
+cat("RMSE CV Stepwise Forward:", round(rmse_stepwise, 5), "\n")
+```
+
+```{r}
+# Predicciones finales con Stepwise Forward sobre test
+vars_sel    <- names(coef(stepwise_forward))[-1]
+formula_sel <- as.formula(
+  paste("log_SalePrice ~", paste(vars_sel, collapse = " + "))
+)
+
+stepwise_final <- lm(formula_sel, data = train_baked)
+
+preds_log  <- predict(stepwise_final, newdata = test_baked)
+preds_real <- exp(preds_log)
+
+
+if (!dir.exists("output")) dir.create("output", showWarnings = FALSE)
+
+archivo_salida <- data.frame(
+  Id        = test$Id,
+  SalePrice = preds_real
+)
+
+nombre_  <- gsub(" ", "_", tolower(nombre_modelo_actual))
+rmse_txt <- round(rmse_stepwise, 5)
+ruta     <- paste0("output/predicciones_", nombre_, "_rmse_", rmse_txt, ".csv")
+
+write.csv(archivo_salida, file = ruta, row.names = FALSE)
+cat("Modelo:", nombre_modelo_actual, "\n")
+cat("RMSE de Validación:", rmse_txt, "\n")
+```
+
 
 ### 
 ```{r}
-print(mejor_lasso_param)
-cat("\n")
-print(mejor_ridge_param)
 cat("\n")
 print(historico_modelos)
 cat("\n")
@@ -599,26 +780,69 @@ print(historial_versiones)
 
 
 
+## RMSE en escala real (dólares)
 
+El RMSE en log es útil para comparar modelos, pero no es intuitivo. Aquí se
+calcula el RMSE en dólares reales usando las **predicciones de validación cruzada**
+ para que la comparación sea justa y no esté inflada por sobreajuste.
 
+```{r}
 
+rmse_real_ols   <- calcular_rmse_real_cv(resultado_ols,   train, "Regresión Lineal OLS")
+rmse_real_lasso <- calcular_rmse_real_cv(resultado_lasso, train, "Regresión Lasso")
+rmse_real_ridge <- calcular_rmse_real_cv(resultado_ridge, train, "Regresión Ridge")
+rmse_real_enet  <- calcular_rmse_real_cv(resultado_enet,  train, "Elastic Net")
 
+# Stepwise: recalcular el loop CV en escala de dolares
+set.seed(42)
+n_sw               <- nrow(train_baked)
+folds_sw           <- sample(rep(1:10, length.out = n_sw))
+rmse_real_folds_sw <- numeric(10)
 
+vars_sel_sw <- names(coef(stepwise_forward))[-1]
+formula_sw  <- as.formula(paste("log_SalePrice ~", paste(vars_sel_sw, collapse = " + ")))
 
+for (k in 1:10) {
+  idx_val    <- which(folds_sw == k)
+  idx_trn    <- which(folds_sw != k)
+  modelo_k   <- lm(formula_sw, data = train_baked[idx_trn, ])
+  pred_log   <- predict(modelo_k, newdata = train_baked[idx_val, ])
+  pred_real  <- exp(pred_log)
+  real_price <- exp(train_baked$log_SalePrice[idx_val])
+  rmse_real_folds_sw[k] <- sqrt(mean((real_price - pred_real)^2))
+}
 
+rmse_real_sw <- mean(rmse_real_folds_sw)
+cat("Modelo: Stepwise Forward\n")
+cat("RMSE en dolares (CV, escala real): $",
+    format(round(rmse_real_sw, 2), big.mark = ","), "\n\n")
+```
 
+```{r}
+# Tabla comparativa final: RMSE log vs RMSE real 
+comparacion_rmse <- data.frame(
+  Modelo = c("Elastic Net", "Regresión Lasso", "Regresión Ridge",
+             "Regresión Lineal OLS", "Stepwise Forward"),
+  RMSE_log = c(rmse_enet, rmse_lasso, rmse_ridge, rmse_ols, rmse_stepwise),
+  RMSE_dolares = c(rmse_real_enet, rmse_real_lasso, rmse_real_ridge,
+                   rmse_real_ols, rmse_real_sw)
+)
 
+comparacion_rmse <- comparacion_rmse[order(comparacion_rmse$RMSE_log), ]
+comparacion_rmse$RMSE_log     <- round(comparacion_rmse$RMSE_log, 5)
+comparacion_rmse$RMSE_dolares <- paste0("$", format(round(comparacion_rmse$RMSE_dolares, 0),
+                                                     big.mark = ","))
+print(comparacion_rmse, row.names = FALSE)
+```
 
+---
 
+## Conclusiones
 
-
-
-
-
-
-
-
-
-
-
+```{r}
+mejor_modelo_nombre <- comparacion_rmse$Modelo[1]
+mejor_rmse_log      <- comparacion_rmse$RMSE_log[1]
+cat("Mejor modelo:", mejor_modelo_nombre, "\n")
+cat("RMSE CV (log):", mejor_rmse_log, "\n")
+```
 
